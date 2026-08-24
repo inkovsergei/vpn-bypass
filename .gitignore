@@ -1,0 +1,7 @@
+.DS_Store
+build/
+dmg-root/
+*.dmg
+*.zip
+DerivedData/
+xcuserdata/
