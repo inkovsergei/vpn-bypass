@@ -19,6 +19,7 @@ clang \
     -O2 \
     -mmacosx-version-min=14.0 \
     -framework Cocoa \
+    -framework SystemConfiguration \
     "$PROJECT_DIR/Sources/main.m" \
     -o "$MACOS_DIR/VPNBypass"
 

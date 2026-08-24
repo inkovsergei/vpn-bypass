@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <SystemConfiguration/SystemConfiguration.h>
 #import <unistd.h>
 
 static NSArray<NSString *> *DefaultDomains(void) {
@@ -52,6 +53,9 @@ static BOOL IsValidDomain(NSString *domain) {
 static NSString * const AutoHelperLabel = @"com.github.inkovsergei.vpnbypass.helper";
 static NSString * const LoginAgentLabel = @"com.github.inkovsergei.vpnbypass.login";
 
+@class AppDelegate;
+static void NetworkConfigurationChanged(SCDynamicStoreRef store, CFArrayRef changedKeys, void *info);
+
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate>
 @property NSWindow *window;
 @property NSMutableArray<NSString *> *domains;
@@ -69,13 +73,23 @@ static NSString * const LoginAgentLabel = @"com.github.inkovsergei.vpnbypass.log
 @property NSButton *autoToggle;
 @property NSProgressIndicator *progress;
 @property NSStatusItem *statusItem;
-@property NSTimer *networkTimer;
+@property NSTimer *networkDebounceTimer;
 @property NSString *lastRouteSignature;
 @property NSString *lastHelperStatus;
 @property BOOL running;
 @property BOOL networkCheckRunning;
 @property BOOL backgroundLaunch;
+@property(assign) SCDynamicStoreRef dynamicStore;
+@property(assign) CFRunLoopSourceRef networkRunLoopSource;
+- (void)scheduleNetworkCheck;
 @end
+
+static void NetworkConfigurationChanged(SCDynamicStoreRef store, CFArrayRef changedKeys, void *info) {
+    AppDelegate *delegate = (__bridge AppDelegate *)info;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [delegate scheduleNetworkCheck];
+    });
+}
 
 @implementation AppDelegate
 
@@ -89,7 +103,7 @@ static NSString * const LoginAgentLabel = @"com.github.inkovsergei.vpnbypass.log
     self.autoToggle.state = [self autoModeInstalled] ? NSControlStateValueOn : NSControlStateValueOff;
     self.removeRoutesButton.enabled = ![self autoModeInstalled];
     NSString *initialLog = [self autoModeInstalled]
-        ? @"Автоматический режим включён. Маршруты обновляются после запуска, смены сети и каждые 5 минут."
+        ? @"Автоматический режим включён. Маршруты обновляются по сетевым событиям, без постоянного опроса системы."
         : @"Готово к работе. Можно запустить обход вручную или включить автоматический режим.";
     [self setLog:initialLog state:0];
     if (self.backgroundLaunch && [self autoModeInstalled]) {
@@ -300,7 +314,7 @@ static NSString * const LoginAgentLabel = @"com.github.inkovsergei.vpnbypass.log
     scroll.documentView = self.logView;
     scroll.hasVerticalScroller = YES;
     scroll.borderType = NSBezelBorder;
-    NSTextField *hint = [self label:@"ⓘ Автоматический режим восстанавливает маршруты после входа, сна, смены сети и IP." size:11 weight:NSFontWeightRegular];
+    NSTextField *hint = [self label:@"ⓘ Событийный монитор почти не использует CPU и просыпается только при изменении сети." size:11 weight:NSFontWeightRegular];
     hint.textColor = NSColor.secondaryLabelColor;
     hint.maximumNumberOfLines = 2;
     hint.lineBreakMode = NSLineBreakByWordWrapping;
@@ -375,19 +389,47 @@ static NSString * const LoginAgentLabel = @"com.github.inkovsergei.vpnbypass.log
 }
 
 - (void)startNetworkMonitoring {
-    self.networkTimer = [NSTimer scheduledTimerWithTimeInterval:10.0 target:self selector:@selector(checkNetworkState:) userInfo:nil repeats:YES];
     [[NSWorkspace sharedWorkspace].notificationCenter addObserver:self selector:@selector(systemDidWake:) name:NSWorkspaceDidWakeNotification object:nil];
-    [self checkNetworkState:nil];
+
+    SCDynamicStoreContext context = {0, (__bridge void *)self, NULL, NULL, NULL};
+    self.dynamicStore = SCDynamicStoreCreate(NULL, CFSTR("VPN Bypass"), NetworkConfigurationChanged, &context);
+    if (self.dynamicStore) {
+        NSArray *patterns = @[
+            @"State:/Network/Global/IPv4",
+            @"State:/Network/Interface/.*/IPv4",
+            @"State:/Network/Service/.*/IPv4"
+        ];
+        SCDynamicStoreSetNotificationKeys(self.dynamicStore, NULL, (__bridge CFArrayRef)patterns);
+        self.networkRunLoopSource = SCDynamicStoreCreateRunLoopSource(NULL, self.dynamicStore, 0);
+        if (self.networkRunLoopSource) {
+            CFRunLoopAddSource(CFRunLoopGetMain(), self.networkRunLoopSource, kCFRunLoopCommonModes);
+        }
+    }
+    [self scheduleNetworkCheck];
 }
 
 - (void)systemDidWake:(NSNotification *)notification {
     self.lastRouteSignature = nil;
-    [self checkNetworkState:nil];
+    [self scheduleNetworkCheck];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
-    [self.networkTimer invalidate];
+    [self.networkDebounceTimer invalidate];
+    if (self.networkRunLoopSource) {
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), self.networkRunLoopSource, kCFRunLoopCommonModes);
+        CFRelease(self.networkRunLoopSource);
+        self.networkRunLoopSource = NULL;
+    }
+    if (self.dynamicStore) {
+        CFRelease(self.dynamicStore);
+        self.dynamicStore = NULL;
+    }
     [[NSWorkspace sharedWorkspace].notificationCenter removeObserver:self];
+}
+
+- (void)scheduleNetworkCheck {
+    [self.networkDebounceTimer invalidate];
+    self.networkDebounceTimer = [NSTimer scheduledTimerWithTimeInterval:3.0 target:self selector:@selector(checkNetworkState:) userInfo:nil repeats:NO];
 }
 
 - (void)checkNetworkState:(id)sender {
@@ -499,7 +541,7 @@ static NSString * const LoginAgentLabel = @"com.github.inkovsergei.vpnbypass.log
             if ([error[NSAppleScriptErrorNumber] integerValue] == -128) message = @"Операция отменена: права администратора не предоставлены.";
             else message = [NSString stringWithFormat:@"Не удалось изменить автоматический режим:\n%@", error[NSAppleScriptErrorMessage] ?: @"Неизвестная ошибка"];
         } else if (!loginAgentOK) {
-            message = @"Helper установлен, но не удалось добавить приложение в автозапуск. Фоновая сверка каждые 5 минут продолжит работать.";
+            message = @"Helper установлен, но не удалось добавить приложение в автозапуск. Резервная фоновая сверка раз в 6 часов продолжит работать.";
         } else {
             message = result.stringValue.length > 0 ? result.stringValue : (enable ? @"Автоматический режим включён." : @"Автоматический режим выключен.");
         }
@@ -511,7 +553,7 @@ static NSString * const LoginAgentLabel = @"com.github.inkovsergei.vpnbypass.log
             self.removeRoutesButton.enabled = ![self autoModeInstalled];
             if (success && enable) {
                 self.lastRouteSignature = nil;
-                [self checkNetworkState:nil];
+                [self scheduleNetworkCheck];
             }
         });
     });

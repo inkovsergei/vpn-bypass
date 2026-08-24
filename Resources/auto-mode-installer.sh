@@ -17,7 +17,7 @@ render_plist() {
     /usr/libexec/PlistBuddy -c "Add :ProgramArguments:1 string --domains-file" "$OUTPUT_PATH"
     /usr/libexec/PlistBuddy -c "Add :ProgramArguments:2 string $CONFIG_PATH" "$OUTPUT_PATH"
     /usr/libexec/PlistBuddy -c "Add :RunAtLoad bool true" "$OUTPUT_PATH"
-    /usr/libexec/PlistBuddy -c "Add :StartInterval integer 300" "$OUTPUT_PATH"
+    /usr/libexec/PlistBuddy -c "Add :StartInterval integer 21600" "$OUTPUT_PATH"
     /usr/libexec/PlistBuddy -c "Add :WatchPaths array" "$OUTPUT_PATH"
     /usr/libexec/PlistBuddy -c "Add :WatchPaths:0 string $CONFIG_PATH" "$OUTPUT_PATH"
     /usr/libexec/PlistBuddy -c "Add :ProcessType string Background" "$OUTPUT_PATH"
