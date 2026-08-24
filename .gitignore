@@ -1,6 +1,6 @@
 .DS_Store
 build/
-dmg-root/
+dmg-root*/
 *.dmg
 *.zip
 DerivedData/

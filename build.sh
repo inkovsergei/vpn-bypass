@@ -24,7 +24,9 @@ clang \
 
 cp "$PROJECT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
 cp "$PROJECT_DIR/Resources/vpn-bypass-runner.sh" "$RESOURCES_DIR/vpn-bypass-runner.sh"
+cp "$PROJECT_DIR/Resources/auto-mode-installer.sh" "$RESOURCES_DIR/auto-mode-installer.sh"
 chmod 755 "$RESOURCES_DIR/vpn-bypass-runner.sh"
+chmod 755 "$RESOURCES_DIR/auto-mode-installer.sh"
 
 clang -fobjc-arc -framework Cocoa "$PROJECT_DIR/IconMaker.m" -o "$BUILD_DIR/icon-maker"
 "$BUILD_DIR/icon-maker" "$BUILD_DIR/icon-1024.png"

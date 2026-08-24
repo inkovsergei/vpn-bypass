@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <unistd.h>
 
 static NSArray<NSString *> *DefaultDomains(void) {
     return @[
@@ -48,6 +49,9 @@ static BOOL IsValidDomain(NSString *domain) {
     return [regex firstMatchInString:domain options:0 range:NSMakeRange(0, domain.length)] != nil;
 }
 
+static NSString * const AutoHelperLabel = @"com.github.inkovsergei.vpnbypass.helper";
+static NSString * const LoginAgentLabel = @"com.github.inkovsergei.vpnbypass.login";
+
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate>
 @property NSWindow *window;
 @property NSMutableArray<NSString *> *domains;
@@ -62,26 +66,54 @@ static BOOL IsValidDomain(NSString *domain) {
 @property NSView *statusDot;
 @property NSButton *runButton;
 @property NSButton *removeRoutesButton;
+@property NSButton *autoToggle;
 @property NSProgressIndicator *progress;
+@property NSStatusItem *statusItem;
+@property NSTimer *networkTimer;
+@property NSString *lastRouteSignature;
+@property NSString *lastHelperStatus;
 @property BOOL running;
+@property BOOL networkCheckRunning;
+@property BOOL backgroundLaunch;
 @end
 
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    self.backgroundLaunch = [NSProcessInfo.processInfo.arguments containsObject:@"--background"];
     [self loadDomains];
     [self buildWindow];
     [self refreshVisibleDomains];
-    [self setLog:@"Готово к работе. Подключите OpenVPN, затем нажмите «Запустить обход»." state:0];
-    [self.window makeKeyAndOrderFront:nil];
-    [NSApp activateIgnoringOtherApps:YES];
+    [self setupStatusItem];
+    [self startNetworkMonitoring];
+    self.autoToggle.state = [self autoModeInstalled] ? NSControlStateValueOn : NSControlStateValueOff;
+    self.removeRoutesButton.enabled = ![self autoModeInstalled];
+    NSString *initialLog = [self autoModeInstalled]
+        ? @"Автоматический режим включён. Маршруты обновляются после запуска, смены сети и каждые 5 минут."
+        : @"Готово к работе. Можно запустить обход вручную или включить автоматический режим.";
+    [self setLog:initialLog state:0];
+    if (self.backgroundLaunch && [self autoModeInstalled]) {
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        [self.window orderOut:nil];
+    } else {
+        [self showMainWindow:nil];
+    }
 }
 
-- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { return YES; }
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { return ![self autoModeInstalled]; }
+
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag {
+    [self showMainWindow:nil];
+    return YES;
+}
 
 - (NSURL *)domainsURL {
     NSURL *base = [[[NSFileManager defaultManager] URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask] firstObject];
     return [[base URLByAppendingPathComponent:@"VPN Bypass" isDirectory:YES] URLByAppendingPathComponent:@"domains.json"];
+}
+
+- (NSURL *)domainsTextURL {
+    return [[self.domainsURL URLByDeletingLastPathComponent] URLByAppendingPathComponent:@"domains.txt"];
 }
 
 - (void)loadDomains {
@@ -96,6 +128,8 @@ static BOOL IsValidDomain(NSString *domain) {
     [[NSFileManager defaultManager] createDirectoryAtURL:directory withIntermediateDirectories:YES attributes:nil error:nil];
     NSData *data = [NSJSONSerialization dataWithJSONObject:self.domains options:NSJSONWritingPrettyPrinted error:nil];
     [data writeToURL:self.domainsURL options:NSDataWritingAtomic error:nil];
+    NSString *plainText = [[self.domains componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
+    [plainText writeToURL:self.domainsTextURL atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 - (void)sortDomains {
@@ -145,6 +179,10 @@ static BOOL IsValidDomain(NSString *domain) {
     self.statusLabel = [self label:@"Ожидание" size:13 weight:NSFontWeightMedium];
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [header addSubview:self.statusLabel];
+    self.autoToggle = [NSButton checkboxWithTitle:@"Автоматически" target:self action:@selector(autoToggleChanged:)];
+    self.autoToggle.toolTip = @"Запуск при входе и автоматическое обновление маршрутов";
+    self.autoToggle.translatesAutoresizingMaskIntoConstraints = NO;
+    [header addSubview:self.autoToggle];
 
     NSSplitView *split = [[NSSplitView alloc] init];
     split.vertical = YES;
@@ -175,10 +213,12 @@ static BOOL IsValidDomain(NSString *domain) {
         [subtitle.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
         [subtitle.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:3],
         [self.statusLabel.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-20],
-        [self.statusLabel.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [self.statusLabel.topAnchor constraintEqualToAnchor:header.topAnchor constant:20],
         [self.statusDot.trailingAnchor constraintEqualToAnchor:self.statusLabel.leadingAnchor constant:-8],
         [self.statusDot.centerYAnchor constraintEqualToAnchor:self.statusLabel.centerYAnchor],
         [self.statusDot.widthAnchor constraintEqualToConstant:8], [self.statusDot.heightAnchor constraintEqualToConstant:8],
+        [self.autoToggle.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-20],
+        [self.autoToggle.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:7],
         [split.topAnchor constraintEqualToAnchor:header.bottomAnchor],
         [split.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
         [split.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
@@ -260,7 +300,7 @@ static BOOL IsValidDomain(NSString *domain) {
     scroll.documentView = self.logView;
     scroll.hasVerticalScroller = YES;
     scroll.borderType = NSBezelBorder;
-    NSTextField *hint = [self label:@"ⓘ OpenVPN подключают до запуска. После смены сети или IP запустите обход снова." size:11 weight:NSFontWeightRegular];
+    NSTextField *hint = [self label:@"ⓘ Автоматический режим восстанавливает маршруты после входа, сна, смены сети и IP." size:11 weight:NSFontWeightRegular];
     hint.textColor = NSColor.secondaryLabelColor;
     hint.maximumNumberOfLines = 2;
     hint.lineBreakMode = NSLineBreakByWordWrapping;
@@ -277,7 +317,7 @@ static BOOL IsValidDomain(NSString *domain) {
 
 - (NSView *)buildFooter {
     NSView *footer = [[NSView alloc] init];
-    NSTextField *hint = [self label:@"🔒 Изменение маршрутов требует пароль администратора" size:11 weight:NSFontWeightRegular];
+    NSTextField *hint = [self label:@"🔒 В автоматическом режиме пароль требуется только при установке helper" size:11 weight:NSFontWeightRegular];
     hint.textColor = NSColor.secondaryLabelColor;
     self.removeRoutesButton = [NSButton buttonWithTitle:@"Удалить маршруты" target:self action:@selector(removeRoutes:)];
     self.runButton = [NSButton buttonWithTitle:@"▶  Запустить обход" target:self action:@selector(runBypass:)];
@@ -295,6 +335,186 @@ static BOOL IsValidDomain(NSString *domain) {
         [self.progress.trailingAnchor constraintEqualToAnchor:self.runButton.leadingAnchor constant:-9], [self.progress.centerYAnchor constraintEqualToAnchor:footer.centerYAnchor]
     ]];
     return footer;
+}
+
+- (BOOL)autoModeInstalled {
+    NSString *helper = [@"/Library/PrivilegedHelperTools" stringByAppendingPathComponent:AutoHelperLabel];
+    NSString *plist = [@"/Library/LaunchDaemons" stringByAppendingPathComponent:[AutoHelperLabel stringByAppendingString:@".plist"]];
+    return [[NSFileManager defaultManager] isExecutableFileAtPath:helper] && [[NSFileManager defaultManager] fileExistsAtPath:plist];
+}
+
+- (void)showMainWindow:(id)sender {
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [self.window makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)setupStatusItem {
+    self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSSquareStatusItemLength];
+    self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"arrow.triangle.branch" accessibilityDescription:@"VPN Bypass"];
+    self.statusItem.button.toolTip = @"VPN Bypass";
+    NSMenu *menu = [[NSMenu alloc] init];
+    [menu addItemWithTitle:@"Открыть VPN Bypass" action:@selector(showMainWindow:) keyEquivalent:@""];
+    [menu addItemWithTitle:@"Обновить маршруты" action:@selector(refreshAutoRoutes:) keyEquivalent:@""];
+    [menu addItem:NSMenuItem.separatorItem];
+    [menu addItemWithTitle:@"Завершить" action:@selector(quitApplication:) keyEquivalent:@""];
+    for (NSMenuItem *item in menu.itemArray) item.target = self;
+    self.statusItem.menu = menu;
+}
+
+- (void)quitApplication:(id)sender { [NSApp terminate:nil]; }
+
+- (void)refreshAutoRoutes:(id)sender {
+    if (![self autoModeInstalled]) {
+        [self showMainWindow:nil];
+        [self setLog:@"Автоматический режим выключен. Включите переключатель «Автоматически»." state:3];
+        return;
+    }
+    [self saveDomains];
+    [self setLog:@"Helper получил запрос на обновление. Маршруты будут сверены в фоне." state:1];
+}
+
+- (void)startNetworkMonitoring {
+    self.networkTimer = [NSTimer scheduledTimerWithTimeInterval:10.0 target:self selector:@selector(checkNetworkState:) userInfo:nil repeats:YES];
+    [[NSWorkspace sharedWorkspace].notificationCenter addObserver:self selector:@selector(systemDidWake:) name:NSWorkspaceDidWakeNotification object:nil];
+    [self checkNetworkState:nil];
+}
+
+- (void)systemDidWake:(NSNotification *)notification {
+    self.lastRouteSignature = nil;
+    [self checkNetworkState:nil];
+}
+
+- (void)applicationWillTerminate:(NSNotification *)notification {
+    [self.networkTimer invalidate];
+    [[NSWorkspace sharedWorkspace].notificationCenter removeObserver:self];
+}
+
+- (void)checkNetworkState:(id)sender {
+    if (![self autoModeInstalled] || self.networkCheckRunning) return;
+    NSString *status = [NSString stringWithContentsOfFile:@"/var/tmp/com.github.inkovsergei.vpnbypass.status" encoding:NSUTF8StringEncoding error:nil];
+    status = [status stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (status.length > 0 && ![status isEqualToString:self.lastHelperStatus]) {
+        self.lastHelperStatus = status;
+        [self setLog:[NSString stringWithFormat:@"Последняя автоматическая сверка:\n%@", status] state:2];
+    }
+    self.networkCheckRunning = YES;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSTask *task = [[NSTask alloc] init];
+        task.executableURL = [NSURL fileURLWithPath:@"/usr/sbin/netstat"];
+        task.arguments = @[@"-rn", @"-f", @"inet"];
+        NSPipe *pipe = [NSPipe pipe];
+        task.standardOutput = pipe;
+        task.standardError = [NSFileHandle fileHandleWithNullDevice];
+        NSError *launchError = nil;
+        BOOL launched = [task launchAndReturnError:&launchError];
+        if (launched) [task waitUntilExit];
+        NSData *data = launched ? [pipe.fileHandleForReading readDataToEndOfFile] : nil;
+        NSString *output = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"";
+        NSMutableArray *routeLines = [NSMutableArray array];
+        __block BOOL vpnPresent = NO;
+        [output enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
+            if ([line hasPrefix:@"default"] || [line hasPrefix:@"0/1"] || [line hasPrefix:@"128.0/1"]) {
+                [routeLines addObject:line];
+                if ([line containsString:@"utun"]) vpnPresent = YES;
+            }
+        }];
+        NSString *signature = [routeLines componentsJoinedByString:@"\n"];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.networkCheckRunning = NO;
+            BOOL changed = self.lastRouteSignature == nil || ![self.lastRouteSignature isEqualToString:signature];
+            self.lastRouteSignature = signature;
+            if (changed && vpnPresent && [self autoModeInstalled]) {
+                [self saveDomains];
+                [self setLog:@"Обнаружено подключение VPN или изменение сети. Helper обновляет маршруты." state:1];
+            }
+        });
+    });
+}
+
+- (int)runTask:(NSString *)path arguments:(NSArray<NSString *> *)arguments {
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:path];
+    task.arguments = arguments;
+    task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+    task.standardError = [NSFileHandle fileHandleWithNullDevice];
+    NSError *error = nil;
+    if (![task launchAndReturnError:&error]) return -1;
+    [task waitUntilExit];
+    return task.terminationStatus;
+}
+
+- (NSURL *)loginAgentURL {
+    NSURL *library = [[[NSFileManager defaultManager] URLsForDirectory:NSLibraryDirectory inDomains:NSUserDomainMask] firstObject];
+    return [[library URLByAppendingPathComponent:@"LaunchAgents" isDirectory:YES] URLByAppendingPathComponent:[LoginAgentLabel stringByAppendingString:@".plist"]];
+}
+
+- (BOOL)configureLoginAgentEnabled:(BOOL)enabled {
+    NSString *domain = [NSString stringWithFormat:@"gui/%u", getuid()];
+    NSString *service = [NSString stringWithFormat:@"%@/%@", domain, LoginAgentLabel];
+    [self runTask:@"/bin/launchctl" arguments:@[@"bootout", service]];
+
+    if (!enabled) {
+        [[NSFileManager defaultManager] removeItemAtURL:self.loginAgentURL error:nil];
+        return YES;
+    }
+
+    NSError *directoryError = nil;
+    [[NSFileManager defaultManager] createDirectoryAtURL:[self.loginAgentURL URLByDeletingLastPathComponent]
+                             withIntermediateDirectories:YES attributes:nil error:&directoryError];
+    if (directoryError) return NO;
+
+    NSDictionary *plist = @{
+        @"Label": LoginAgentLabel,
+        @"ProgramArguments": @[@"/usr/bin/open", @"-gj", NSBundle.mainBundle.bundlePath, @"--args", @"--background"],
+        @"RunAtLoad": @YES,
+        @"ProcessType": @"Interactive"
+    };
+    NSData *plistData = [NSPropertyListSerialization dataWithPropertyList:plist format:NSPropertyListXMLFormat_v1_0 options:0 error:nil];
+    if (!plistData || ![plistData writeToURL:self.loginAgentURL options:NSDataWritingAtomic error:nil]) return NO;
+    return [self runTask:@"/bin/launchctl" arguments:@[@"bootstrap", domain, self.loginAgentURL.path]] == 0;
+}
+
+- (void)autoToggleChanged:(NSButton *)sender {
+    if (self.running) return;
+    BOOL enable = sender.state == NSControlStateValueOn;
+    sender.enabled = NO;
+    [self saveDomains];
+    [self setLog:(enable ? @"Устанавливаю автоматический helper. Подтвердите права администратора один раз…" : @"Отключаю автоматический режим и удаляю его маршруты…") state:1];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *installer = [[NSBundle mainBundle] pathForResource:@"auto-mode-installer" ofType:@"sh"];
+        NSString *runner = [[NSBundle mainBundle] pathForResource:@"vpn-bypass-runner" ofType:@"sh"];
+        NSString *command = enable
+            ? [NSString stringWithFormat:@"%@ --install %@ %@", ShellQuote(installer), ShellQuote(runner), ShellQuote(self.domainsTextURL.path)]
+            : [NSString stringWithFormat:@"%@ --uninstall", ShellQuote(installer)];
+        NSString *source = [NSString stringWithFormat:@"do shell script %@ with administrator privileges", AppleScriptQuote(command)];
+        NSAppleScript *script = [[NSAppleScript alloc] initWithSource:source];
+        NSDictionary *error = nil;
+        NSAppleEventDescriptor *result = [script executeAndReturnError:&error];
+        BOOL success = error == nil;
+        BOOL loginAgentOK = success ? [self configureLoginAgentEnabled:enable] : NO;
+        NSString *message = nil;
+        if (!success) {
+            if ([error[NSAppleScriptErrorNumber] integerValue] == -128) message = @"Операция отменена: права администратора не предоставлены.";
+            else message = [NSString stringWithFormat:@"Не удалось изменить автоматический режим:\n%@", error[NSAppleScriptErrorMessage] ?: @"Неизвестная ошибка"];
+        } else if (!loginAgentOK) {
+            message = @"Helper установлен, но не удалось добавить приложение в автозапуск. Фоновая сверка каждые 5 минут продолжит работать.";
+        } else {
+            message = result.stringValue.length > 0 ? result.stringValue : (enable ? @"Автоматический режим включён." : @"Автоматический режим выключен.");
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            sender.enabled = YES;
+            sender.state = [self autoModeInstalled] ? NSControlStateValueOn : NSControlStateValueOff;
+            [self setLog:message state:(success ? 2 : 3)];
+            self.removeRoutesButton.enabled = ![self autoModeInstalled];
+            if (success && enable) {
+                self.lastRouteSignature = nil;
+                [self checkNetworkState:nil];
+            }
+        });
+    });
 }
 
 - (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView { return self.visibleDomains.count; }
@@ -372,6 +592,15 @@ static BOOL IsValidDomain(NSString *domain) {
 
 - (void)executeRemove:(BOOL)remove {
     if (self.running || (!remove && self.domains.count == 0)) return;
+    if ([self autoModeInstalled]) {
+        if (remove) {
+            [self setLog:@"Сначала выключите переключатель «Автоматически»: helper удалит маршруты и не создаст их снова." state:3];
+        } else {
+            [self saveDomains];
+            [self setLog:@"Helper получил запрос. Маршруты обновляются в фоне без повторного ввода пароля." state:1];
+        }
+        return;
+    }
     [self saveDomains];
     self.running = YES;
     self.runButton.enabled = NO; self.removeRoutesButton.enabled = NO;
